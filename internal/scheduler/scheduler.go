@@ -1,5 +1,5 @@
-// Package scheduler 定时任务：每日签到（09/21点）+ token keepalive（22点）。
-// 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
+// Package scheduler 定时任务：每日签到（09/21点）+ token keepalive（22点）+
+// 定期余额刷新。签到/刷新成功后重查余额，余额 > 0 的冷却账号自动解冻。
 package scheduler
 
 import (
@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"lobsterai2api/internal/auth"
 	"lobsterai2api/internal/pool"
 	"lobsterai2api/internal/upstream"
 )
@@ -16,8 +17,9 @@ import (
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
-	CheckinHours   []int // 默认 [9, 21]
-	KeepaliveHours []int // 默认 [22]
+	CheckinHours   []int         // 默认 [9, 21]
+	KeepaliveHours []int         // 默认 [22]
+	QuotaRefresh   time.Duration // 定期刷新余额，默认 30m
 }
 
 // Scheduler 调度器。
@@ -32,6 +34,9 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
+	}
+	if cfg.QuotaRefresh <= 0 {
+		cfg.QuotaRefresh = 30 * time.Minute
 	}
 	return &Scheduler{cfg: cfg}
 }
@@ -54,6 +59,8 @@ func nextFire(now time.Time, hours []int) time.Time {
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
 	all := append(append([]int{}, s.cfg.CheckinHours...), s.cfg.KeepaliveHours...)
+	quotaTicker := time.NewTicker(s.cfg.QuotaRefresh)
+	defer quotaTicker.Stop()
 	for {
 		next := nextFire(time.Now(), all)
 		timer := time.NewTimer(time.Until(next))
@@ -69,6 +76,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 			if contains(s.cfg.KeepaliveHours, h) {
 				s.RunKeepaliveNow()
 			}
+		case <-quotaTicker.C:
+			// 不依赖签到：定时拉一次真实余额，避免 pool.credits 只在 9/21 点更新。
+			s.RunQuotaRefreshNow()
 		}
 	}
 }
@@ -97,13 +107,33 @@ func (s *Scheduler) RunCheckinNow() {
 			log.Printf("checkin %s: %v", st.UID, err)
 			// 已签到等业务错误也继续走余额查询
 		}
-		remain, _, err := s.cfg.Upstream.QuotaUsage(a)
-		if err != nil {
-			log.Printf("quota %s: %v", st.UID, err)
+		s.refreshQuota(st.UID, a)
+	}
+}
+
+// RunQuotaRefreshNow 只刷新余额，不签到。
+func (s *Scheduler) RunQuotaRefreshNow() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.RefreshToken == "" {
+			continue
+		}
+		s.refreshQuota(st.UID, a)
 	}
+}
+
+// refreshQuota 查询真实余额并写回池；余额 > 0 时同时解除冷却。
+// QuotaUsage 在余额为 0 时返回 (0, nil)，所以 0 也会被正确持久化。
+func (s *Scheduler) refreshQuota(uid string, a *auth.Auth) {
+	remain, _, err := s.cfg.Upstream.QuotaUsage(a)
+	if err != nil {
+		log.Printf("quota %s: %v", uid, err)
+		return
+	}
+	s.cfg.Pool.ReenableIfCredits(uid, remain)
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。

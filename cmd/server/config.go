@@ -25,8 +25,9 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule struct {
-		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
-		KeepaliveHours []int `json:"keepalive_hours"` // [22]
+		CheckinHours   []int  `json:"checkin_hours"`   // [9,21]
+		KeepaliveHours []int  `json:"keepalive_hours"` // [22]
+		QuotaRefresh   string `json:"quota_refresh"`   // "30m"
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -34,9 +35,10 @@ type Config struct {
 	} `json:"upstream"`
 
 	// 解析后
-	HardCreditDur  time.Duration `json:"-"`
-	SoftRateDur    time.Duration `json:"-"`
-	ErrCooldownDur time.Duration `json:"-"`
+	HardCreditDur   time.Duration `json:"-"`
+	SoftRateDur     time.Duration `json:"-"`
+	ErrCooldownDur  time.Duration `json:"-"`
+	QuotaRefreshDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -53,6 +55,7 @@ func Default() *Config {
 	c.Cooldown.ErrCooldown = "10m"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.QuotaRefresh = "30m"
 	c.Upstream.TimeoutSeconds = 180
 	return c
 }
@@ -103,6 +106,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("LB2A_ERR_COOLDOWN"); v != "" {
 		c.Cooldown.ErrCooldown = v
 	}
+	if v := os.Getenv("LB2A_QUOTA_REFRESH"); v != "" {
+		c.Schedule.QuotaRefresh = v
+	}
 	if v := os.Getenv("LB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
@@ -120,6 +126,15 @@ func (c *Config) normalize() error {
 	}
 	if c.ErrCooldownDur, err = time.ParseDuration(c.Cooldown.ErrCooldown); err != nil {
 		return fmt.Errorf("cooldown.err_cooldown: %w", err)
+	}
+	if c.Schedule.QuotaRefresh == "" {
+		c.Schedule.QuotaRefresh = "30m"
+	}
+	if c.QuotaRefreshDur, err = time.ParseDuration(c.Schedule.QuotaRefresh); err != nil {
+		return fmt.Errorf("schedule.quota_refresh: %w", err)
+	}
+	if c.QuotaRefreshDur <= 0 {
+		c.QuotaRefreshDur = 30 * time.Minute
 	}
 	if c.Cooldown.ErrThresh <= 0 {
 		c.Cooldown.ErrThresh = 3

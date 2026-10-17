@@ -11,7 +11,8 @@
   },
   "schedule": {
     "checkin_hours": [9, 21],
-    "keepalive_hours": [22]
+    "keepalive_hours": [22],
+    "quota_refresh": "30m"
   },
   "upstream": {
     "timeout_seconds": 180,

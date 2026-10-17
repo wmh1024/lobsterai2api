@@ -41,9 +41,7 @@ func main() {
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
 	p := pool.New(cfg.StateFile)
-	for _, a := range auths {
-		p.Add(a)
-	}
+	p.SyncToDir(auths)
 
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -53,6 +51,7 @@ func main() {
 		Upstream:       up,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		QuotaRefresh:   cfg.QuotaRefreshDur,
 	})
 
 	h := server.NewHandler(server.Config{

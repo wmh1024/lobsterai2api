@@ -30,7 +30,7 @@ func TestChatStreamPassthroughByteExact(t *testing.T) {
 
 	t.Setenv("LB2A_UPSTREAM_BASE", srv.URL)
 	c := New()
-	rc, status, err := c.ChatStream(&auth.Auth{AccessToken: "tok", UID: "1"}, []byte(`{"model":"m"}`))
+	rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "tok", UID: "1"}, []byte(`{"model":"m"}`))
 	if err != nil || rc == nil || status != 200 {
 		t.Fatalf("ChatStream: rc=%v status=%d err=%v", rc, status, err)
 	}
@@ -45,6 +45,24 @@ func TestChatStreamPassthroughByteExact(t *testing.T) {
 	}
 }
 
+// 余额为 0 是有效查询结果：必须写回 0，而不是返回 error 让调度器跳过更新。
+func TestQuotaUsageZeroIsNotError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"code":0,"data":{"totalCreditsRemaining":0}}`)
+	}))
+	defer srv.Close()
+
+	t.Setenv("LB2A_UPSTREAM_BASE", srv.URL)
+	c := New()
+	remain, _, err := c.QuotaUsage(&auth.Auth{AccessToken: "tok", UID: "1"})
+	if err != nil {
+		t.Fatalf("zero balance should not be an error: %v", err)
+	}
+	if remain != 0 {
+		t.Fatalf("remain=%d, want 0", remain)
+	}
+}
+
 // 200 流内的错误帧仍须被识别为上游错误（窥探逻辑的原始目的）。
 func TestChatStreamErrorFrameIn200(t *testing.T) {
 	frame := "event:error\ndata:{\"type\":\"error\",\"error\":{\"type\":\"proxy_error\",\"message\":\"免费额度已用完，请升级套餐\",\"code\":40201}}\n\n"
@@ -56,14 +74,14 @@ func TestChatStreamErrorFrameIn200(t *testing.T) {
 
 	t.Setenv("LB2A_UPSTREAM_BASE", srv.URL)
 	c := New()
-	rc, status, err := c.ChatStream(&auth.Auth{AccessToken: "tok", UID: "1"}, []byte(`{"model":"m"}`))
+	rc, status, errBody, err := c.ChatStream(&auth.Auth{AccessToken: "tok", UID: "1"}, []byte(`{"model":"m"}`))
 	if err != nil {
 		t.Fatalf("ChatStream transport: %v", err)
 	}
 	if rc != nil || status != 200 {
 		t.Fatalf("错误帧未被拦下: rc=%v status=%d", rc, status)
 	}
-	if k := Classify(status, string(c.LastBody)); k != ErrHardCredit {
+	if k := Classify(status, string(errBody)); k != ErrHardCredit {
 		t.Fatalf("分类错误: got %s want %s", k, ErrHardCredit)
 	}
 }

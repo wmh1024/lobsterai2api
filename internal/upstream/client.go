@@ -91,8 +91,7 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。
 type Client struct {
-	HTTP     *http.Client
-	LastBody []byte // 最近一次非 2xx 响应体，供调用方 Classify
+	HTTP *http.Client
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -123,7 +122,6 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	c.LastBody = raw
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -247,32 +245,30 @@ func prepareChatBody(rawBody []byte) []byte {
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
-// 非 2xx 时 rc 为 nil、status 为上游状态码、err 为 nil（body 在 c.LastBody，
-// 调用方用 Classify(status, body) 判定）；只有传输层失败才返回 err。
-// ⚠️ 龙虾会把部分业务错误（如额度不足 code=40201）藏在 HTTP 200 的 SSE 流里
-//（event:error 帧），且帧在流首 → 对 200 响应先窥探首块，识别出错误帧就按
-// 非 2xx 同样路径处理（rc=nil + LastBody，由调用方 Classify），否则错误会
-// 假装成空 content 的正常响应穿透到客户端。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, err error) {
+// 非 2xx 时 rc 为 nil、status 为上游状态码、errBody 为响应体；
+// 200 但流首是业务错误帧（如额度不足 code=40201）时同样返回 rc=nil + errBody，
+// 由调用方用 Classify(status, errBody) 判定并换号。
+// 只有传输层失败才返回 err。
+// ⚠️ errBody 按请求返回，不再放在 Client 共享字段里，避免并发请求互相覆盖。
+func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, errBody []byte, err error) {
 	url := ServerBase() + "/api/proxy/v1/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepareChatBody(body)))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	chatHeaders(req, a)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		c.LastBody = raw
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, nil
+		return nil, resp.StatusCode, raw, nil
 	}
 	// Peek 不消费：单次窥探后把同一个 bufio 交给下游，流首无损透传。
 	br := bufio.NewReaderSize(resp.Body, peekBufSize)
@@ -282,13 +278,12 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 	if len(head) > 0 && isSSEErrorFrame(head) {
 		resp.Body.Close()
-		c.LastBody = head
 		kind := Classify(resp.StatusCode, string(head))
 		log.Printf("chat_stream uid=%s: upstream 200-with-error %s body=%s",
 			a.UID, kind, truncate(string(head), 200))
-		return nil, resp.StatusCode, nil
+		return nil, resp.StatusCode, head, nil
 	}
-	return &peekCloser{r: br, c: resp.Body}, resp.StatusCode, nil
+	return &peekCloser{r: br, c: resp.Body}, resp.StatusCode, nil, nil
 }
 
 // peekBufSize 首块窥探窗口：错误帧总在流首（实测 <200 字节），正常响应
@@ -406,7 +401,9 @@ func (c *Client) QuotaUsage(a *auth.Auth) (remain int64, total int64, err error)
 	if ps.TotalCreditsRemaining > 0 {
 		return clamp(ps.TotalCreditsRemaining), 0, nil
 	}
-	return 0, 0, fmt.Errorf("profile-summary: no credits")
+	// 余额为 0 是有效查询结果，不是查询失败。
+	// 旧实现返回 error，调度器会 continue，导致 pool.credits 永远保留耗尽前的旧值。
+	return 0, 0, nil
 }
 
 // newUUID 生成随机 UUID4（幂等键用）。

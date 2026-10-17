@@ -19,7 +19,6 @@ type Config struct {
 	Pool         *pool.Pool
 	Upstream     *upstream.Client
 	APIKey       string        // 空 = 不鉴权
-	MaxRotate    int           // 单请求最多换号次数，默认 3
 	HardCooldown time.Duration // 余额不足冷却，默认 12h
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	ErrThreshold int           // 连续其他错误冷却阈值，默认 3
@@ -35,9 +34,6 @@ type Handler struct {
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
-	if cfg.MaxRotate <= 0 {
-		cfg.MaxRotate = 3
-	}
 	if cfg.HardCooldown <= 0 {
 		cfg.HardCooldown = 12 * time.Hour
 	}
@@ -187,7 +183,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 尝试所有健康账号（每个账号最多一次），而不是固定 3 次。
+	// tried 保证循环必然终止：PickExcluding 取不到号时返回 nil。
+	for {
 		acct := h.cfg.Pool.PickExcluding(tried)
 		if acct == nil {
 			break
@@ -209,67 +207,86 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = acct.SaveAtomic()
 		}
 
-		rc, status, terr := h.cfg.Upstream.ChatStream(acct, body)
+		rc, status, errBody, terr := h.cfg.Upstream.ChatStream(acct, body)
 		if terr != nil {
 			lastErr = terr
-			// 200 流内错误帧（额度不足等）也走冷却：按分类挑冷却强度，
-			// 没分类信息才退回普通 NoteError。
 			var ue *upstream.Error
 			if errors.As(terr, &ue) && ue.Kind == upstream.ErrHardCredit {
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
+				h.cfg.Pool.Exhaust(acct.UID, h.cfg.HardCooldown, "余额不足")
 			} else {
 				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 			}
 			continue
 		}
 		if rc == nil {
-			// 非 2xx，或 200 但流首就是错误帧：统一用 LastBody 分类处置。
-			kind := upstream.Classify(status, string(h.cfg.Upstream.LastBody))
+			// 非 2xx，或 200 但流首就是错误帧。errBody 是按请求返回的，
+			// 不会像旧的 Client.LastBody 那样被并发请求覆盖。
+			kind := upstream.Classify(status, string(errBody))
+			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(errBody)}
 			switch kind {
 			case upstream.ErrClient:
 				// 请求侧问题（未知模型等）：不冷却账号、不换号，
 				// 直接回 4xx 并带上游原因，避免退化成 no_healthy_account。
 				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-					truncateMsg(string(h.cfg.Upstream.LastBody)))
+					truncateMsg(string(errBody)))
 				return
 			case upstream.ErrHardCredit:
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额不足")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
+				h.cfg.Pool.Exhaust(acct.UID, h.cfg.HardCooldown, "余额不足")
 				continue
 			case upstream.ErrSoftRate:
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
 			case upstream.ErrSessionDead:
 				h.cfg.Pool.Disable(acct.UID, "session dead")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
 			case upstream.ErrNotFound:
 				// 404 短冷却不累计 errCount（防雪崩）
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
 			default:
 				// 轮转下一个账号，不直接返回（防雪崩）
 				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(h.cfg.Upstream.LastBody)}
 				continue
 			}
 		}
-		defer rc.Close()
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		if peek.Stream {
+			defer rc.Close()
 			_ = upstream.Stream(w, rc)
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
+		_ = rc.Close()
 		if err != nil {
-			// 上游 200 + SSE 错误帧（如未知模型）在此暴露。属请求侧问题，
-			// 不冷却账号、不换号，直接回 4xx 让调用方看到真实原因。
+			// 错误帧可能不在流首 4KB 内（ChatStream 没拦下），非流式聚合时
+			// 才暴露出来。这里按分类继续换号，不能把额度不足误报成 502。
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrClient {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", ue.Msg)
-				return
+			if errors.As(err, &ue) {
+				switch ue.Kind {
+				case upstream.ErrClient:
+					writeOpenAIError(w, http.StatusBadRequest, "invalid_request", ue.Msg)
+					return
+				case upstream.ErrHardCredit:
+					h.cfg.Pool.Exhaust(acct.UID, h.cfg.HardCooldown, "余额不足")
+					lastErr = err
+					continue
+				case upstream.ErrSoftRate:
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+					lastErr = err
+					continue
+				case upstream.ErrSessionDead:
+					h.cfg.Pool.Disable(acct.UID, "session dead")
+					lastErr = err
+					continue
+				case upstream.ErrNotFound:
+					h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+					lastErr = err
+					continue
+				default:
+					h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					lastErr = err
+					continue
+				}
 			}
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
@@ -278,6 +295,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
+	var ue *upstream.Error
+	if errors.As(lastErr, &ue) && ue.Kind == upstream.ErrHardCredit {
+		msg = "all accounts out of credits"
+	}
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
